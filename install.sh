@@ -179,72 +179,173 @@ ensure_node20() {
 }
 
 # ==========================================
-# 通道管理
+# 矩阵状态机与本地影子注册表
 # ==========================================
-add_qq_channel() {
-    require_root || return 1
-    require_cmd openclaw || return 1
+MATRIX_DB="/opt/openclaw/matrix.db"
 
-    local qq_appid qq_secret
-
-    read -p "请输入 QQ AppID: " qq_appid
-    if [ -z "${qq_appid}" ]; then
-        log_error "AppID 不能为空。"
-        return 1
+init_matrix_db() {
+    mkdir -p /opt/openclaw
+    if [[ ! -f "${MATRIX_DB}" ]]; then
+        touch "${MATRIX_DB}"
+        chmod 600 "${MATRIX_DB}" # 锁死权限
     fi
-
-    read -s -p "请输入 QQ AppSecret: " qq_secret
-    echo
-    if [ -z "${qq_secret}" ]; then
-        log_error "AppSecret 不能为空。"
-        return 1
-    fi
-
-    log_info "安装 QQ 插件..."
-    openclaw plugins install @sliverp/qqbot@latest
-
-    log_warn "注意：受上游 openclaw CLI 参数设计限制，token 仍通过 --token 传入，理论上可能暴露在进程参数中。"
-
-    log_info "注入 QQ 通道配置..."
-    openclaw channels add --channel qqbot --token "${qq_appid}:${qq_secret}"
-
-    log_info "热重载 OpenClaw 网关..."
-    openclaw gateway restart
-    restart_openclaw_service
 }
 
-remove_qq_channel() {
+_gateway_inject() {
+    local alias="$1" platform="$2" cred1="$3" cred2="$4"
+    if [[ "${platform}" == "qq" ]]; then
+        ( export OC_TEMP="${cred1}:${cred2}"; openclaw channels add --channel "${alias}" --token "${OC_TEMP}" >/dev/null 2>&1 )
+    elif [[ "${platform}" == "tg" ]]; then
+        openclaw channels add --channel "${alias}" --token "${cred1}" >/dev/null 2>&1
+    fi
+}
+
+_gateway_eject() {
+    openclaw channels remove --channel "$1" >/dev/null 2>&1 || true
+}
+
+list_matrix() {
+    clear
+    echo -e "${CYAN}=== 当前神经元矩阵状态池 ===${NC}"
+    if [[ ! -s "${MATRIX_DB}" ]]; then
+        echo -e "${YELLOW}注册表为空，暂无机器人节点。${NC}"
+        return
+    fi
+    printf "%-18s | %-8s | %-10s\n" "节点代号 (Alias)" "通讯协议" "运行时状态"
+    echo "------------------------------------------------"
+    while IFS='|' read -r alias platform status c1 c2; do
+        if [[ "${status}" == "active" ]]; then
+            printf "%-18s | %-8s | ${GREEN}%-10s${NC}\n" "${alias}" "${platform}" "[运行中]"
+        else
+            printf "%-18s | %-8s | ${YELLOW}%-10s${NC}\n" "${alias}" "${platform}" "[已暂停]"
+        fi
+    done < "${MATRIX_DB}"
+    echo "------------------------------------------------"
+}
+
+add_matrix_node() {
+    require_root || return 1
+    require_cmd openclaw || return 1
+    init_matrix_db
+
+    local alias platform c1 c2 plat_choice
+    read -p "请输入唯一的节点代号 (如 qq_01, tg_main): " alias
+    [[ -z "${alias}" ]] && { log_error "代号不能为空"; return 1; }
+    if grep -q "^${alias}|" "${MATRIX_DB}"; then
+        log_error "节点代号 [${alias}] 已存在，请使用其他命名！"; return 1
+    fi
+
+    echo -e "1) QQ 官方协议   2) Telegram 协议"
+    read -p "选择平台(1-2): " plat_choice
+    if [[ "${plat_choice}" == "1" ]]; then
+        platform="qq"
+        read -p "输入 QQ AppID: " c1
+        read -s -p "输入 QQ AppSecret: " c2; echo
+        [[ -z "${c1}" || -z "${c2}" ]] && { log_error "凭证缺失"; return 1; }
+        openclaw plugins install @sliverp/qqbot@latest >/dev/null 2>&1 || true
+    elif [[ "${plat_choice}" == "2" ]]; then
+        platform="tg"
+        read -s -p "输入 TG Bot Token: " c1; echo
+        c2="none"
+        [[ -z "${c1}" ]] && { log_error "凭证缺失"; return 1; }
+    else
+        log_error "无效选择"; return 1
+    fi
+
+    echo "${alias}|${platform}|active|${c1}|${c2}" >> "${MATRIX_DB}"
+    _gateway_inject "${alias}" "${platform}" "${c1}" "${c2}"
+    
+    openclaw gateway restart
+    restart_openclaw_service
+    log_success "节点 [${alias}] 已挂载并激活。"
+}
+
+pause_matrix_node() {
+    require_root || return 1
+    require_cmd openclaw || return 1
+    
+    local alias record r_plat
+    read -p "请输入需要【暂停】的节点代号: " alias
+    record=$(grep "^${alias}|" "${MATRIX_DB}" || true)
+    [[ -z "${record}" ]] && { log_error "未找到该节点"; return 1; }
+    
+    IFS='|' read -r _ r_plat r_status r_c1 r_c2 <<< "${record}"
+    [[ "${r_status}" == "paused" ]] && { log_warn "节点已经是休眠状态。"; return 0; }
+
+    # 防御性更新数据库
+    grep -v "^${alias}|" "${MATRIX_DB}" > "${MATRIX_DB}.tmp"
+    echo "${alias}|${r_plat}|paused|${r_c1}|${r_c2}" >> "${MATRIX_DB}.tmp"
+    mv "${MATRIX_DB}.tmp" "${MATRIX_DB}"
+    
+    _gateway_eject "${alias}"
+    openclaw gateway restart
+    restart_openclaw_service
+    log_warn "节点 [${alias}] 已物理断开，配置封存。"
+}
+
+resume_matrix_node() {
     require_root || return 1
     require_cmd openclaw || return 1
 
-    read -p "确认摘除 QQ 通道？(y/n): " confirm
-    if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
-        log_warn "已取消。"
-        return 0
-    fi
+    local alias record
+    read -p "请输入需要【唤醒】的节点代号: " alias
+    record=$(grep "^${alias}|" "${MATRIX_DB}" || true)
+    [[ -z "${record}" ]] && { log_error "未找到该节点"; return 1; }
+    
+    IFS='|' read -r r_alias r_plat r_status r_c1 r_c2 <<< "${record}"
+    [[ "${r_status}" == "active" ]] && { log_warn "该节点已在运行中。"; return 0; }
 
-    openclaw channels remove --channel qqbot
+    grep -v "^${alias}|" "${MATRIX_DB}" > "${MATRIX_DB}.tmp"
+    echo "${alias}|${r_plat}|active|${r_c1}|${r_c2}" >> "${MATRIX_DB}.tmp"
+    mv "${MATRIX_DB}.tmp" "${MATRIX_DB}"
+    
+    _gateway_inject "${r_alias}" "${r_plat}" "${r_c1}" "${r_c2}"
+    openclaw gateway restart
     restart_openclaw_service
+    log_success "节点 [${alias}] 唤醒成功。"
+}
+
+delete_matrix_node() {
+    require_root || return 1
+    require_cmd openclaw || return 1
+
+    local alias
+    read -p "请输入需要【永久销毁】的节点代号: " alias
+    grep -q "^${alias}|" "${MATRIX_DB}" || { log_error "未找到该节点"; return 1; }
+    
+    read -p "确认彻底销毁 [${alias}]？(y/n): " confirm
+    [[ "${confirm}" != "y" && "${confirm}" != "Y" ]] && return 0
+
+    grep -v "^${alias}|" "${MATRIX_DB}" > "${MATRIX_DB}.tmp"
+    mv "${MATRIX_DB}.tmp" "${MATRIX_DB}"
+    
+    _gateway_eject "${alias}"
+    openclaw gateway restart
+    restart_openclaw_service
+    log_success "节点 [${alias}] 已永久抹除。"
 }
 
 manage_channels() {
     require_root || return
     require_cmd openclaw || { pause; return; }
+    init_matrix_db
 
     while true; do
-        clear
+        list_matrix
         echo -e "${CYAN}=================================================${NC}"
-        echo -e "       ${YELLOW}多端通道接入总线${NC}"
+        echo -e " ${GREEN}1.${NC} ➕ 新增挂载 (Add)"
+        echo -e " ${YELLOW}2.${NC} ⏸️  暂停节点 (Pause)"
+        echo -e " ${GREEN}3.${NC} ▶️  唤醒节点 (Resume)"
+        echo -e " ${RED}4.${NC} 🗑️  永久销毁 (Delete)"
+        echo -e " ${BLUE}0.${NC} ↩️  返回主菜单"
         echo -e "${CYAN}=================================================${NC}"
-        echo -e " ${GREEN}1.${NC} 接入 QQ 官方协议"
-        echo -e " ${RED}2.${NC} 摘除 QQ 通道"
-        echo -e " ${YELLOW}0.${NC} 返回上一级"
-        echo -e "${CYAN}=================================================${NC}"
-        read -r -p "指令输入 (0-2): " ch_choice
+        read -r -p "下达指令 (0-4): " ch_choice
 
         case "${ch_choice}" in
-            1) add_qq_channel; pause ;;
-            2) remove_qq_channel; pause ;;
+            1) add_matrix_node; pause ;;
+            2) pause_matrix_node; pause ;;
+            3) resume_matrix_node; pause ;;
+            4) delete_matrix_node; pause ;;
             0) break ;;
             *) log_error "无效指令"; sleep 1 ;;
         esac
@@ -261,9 +362,7 @@ deploy_memory_engine() {
     log_info "开始部署 Qdrant 向量记忆库..."
 
     ensure_docker
-
     mkdir -p /opt/qdrant/storage
-
     docker rm -f qdrant >/dev/null 2>&1 || true
 
     log_info "创建并启动 qdrant 容器..."
@@ -309,7 +408,6 @@ install_core() {
         libgbm1 libasound2 fonts-wqy-zenhei fonts-wqy-microhei >/dev/null 2>&1
 
     require_cmd xvfb-run
-
     ensure_node20
 
     log_info "安装 OpenClaw CLI..."
@@ -323,6 +421,7 @@ install_core() {
     fi
 
     mkdir -p /opt/openclaw
+    init_matrix_db
 
     log_info "写入 systemd 服务..."
     cat > /etc/systemd/system/openclaw.service <<SERVICE
@@ -377,7 +476,7 @@ nuke_system() {
     rm -f /etc/systemd/system/openclaw.service
     systemctl daemon-reload
 
-    log_info "清理 OpenClaw 数据..."
+    log_info "清理 OpenClaw 数据及注册表..."
     rm -rf /root/.openclaw /opt/openclaw
 
     if command -v npm >/dev/null 2>&1; then
@@ -402,53 +501,36 @@ view_logs() {
 }
 
 # ==========================================
-# 命令模式
+# 命令模式 (暴露给外部脚本与 CI/CD 调度)
 # ==========================================
-cmd_install_core() {
-    install_core
-}
-
-cmd_deploy_memory() {
-    deploy_memory_engine
-}
-
-cmd_restart_core() {
-    require_root || return 1
-    restart_openclaw_service
-}
-
-cmd_stop_core() {
-    require_root || return 1
-    systemctl stop openclaw
-    log_warn "OpenClaw 服务已停止。"
-}
-
-cmd_add_qq() {
-    add_qq_channel
-}
-
-cmd_remove_qq() {
-    remove_qq_channel
-}
-
-cmd_status() {
-    printf "算力状态: %b | 记忆状态: %b\n" "$(check_core_status)" "$(check_memory_status)"
-}
+cmd_install_core()  { install_core; }
+cmd_deploy_memory() { deploy_memory_engine; }
+cmd_restart_core()  { require_root || return 1; restart_openclaw_service; }
+cmd_stop_core()     { require_root || return 1; systemctl stop openclaw; log_warn "OpenClaw 已停止。"; }
+cmd_matrix_add()    { add_matrix_node; }
+cmd_matrix_pause()  { pause_matrix_node; }
+cmd_matrix_resume() { resume_matrix_node; }
+cmd_matrix_delete() { delete_matrix_node; }
+cmd_matrix_list()   { list_matrix; }
+cmd_status()        { printf "算力状态: %b | 记忆状态: %b\n" "$(check_core_status)" "$(check_memory_status)"; }
 
 show_help() {
     cat <<'EOF'
 用法:
   ./openclaw_master.sh                 进入交互菜单
-  ./openclaw_master.sh status         查看状态
-  ./openclaw_master.sh install-core   部署 OpenClaw 核心
-  ./openclaw_master.sh deploy-memory  部署 Qdrant
-  ./openclaw_master.sh restart-core   重启 OpenClaw
-  ./openclaw_master.sh stop-core      停止 OpenClaw
-  ./openclaw_master.sh add-qq         添加 QQ 通道
-  ./openclaw_master.sh remove-qq      删除 QQ 通道
-  ./openclaw_master.sh logs           查看 OpenClaw 日志
-  ./openclaw_master.sh nuke           销毁 OpenClaw 与 Qdrant
-  ./openclaw_master.sh help           显示帮助
+  ./openclaw_master.sh status          查看状态
+  ./openclaw_master.sh install-core    部署 OpenClaw 核心
+  ./openclaw_master.sh deploy-memory   部署 Qdrant
+  ./openclaw_master.sh restart-core    重启 OpenClaw
+  ./openclaw_master.sh stop-core       停止 OpenClaw
+  ./openclaw_master.sh matrix-add      添加节点 (QQ/TG)
+  ./openclaw_master.sh matrix-pause    暂停指定节点
+  ./openclaw_master.sh matrix-resume   唤醒指定节点
+  ./openclaw_master.sh matrix-delete   永久销毁节点
+  ./openclaw_master.sh matrix-list     查看节点列表
+  ./openclaw_master.sh logs            查看日志
+  ./openclaw_master.sh nuke            销毁系统
+  ./openclaw_master.sh help            显示帮助
 EOF
 }
 
@@ -459,17 +541,17 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 部署基座 ${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 (V3.1 终极融合版)${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
-        echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
+        echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座 (Node/Xvfb/Systemd)"
         echo -e " ${CYAN}2.${NC} 🧠 部署 Qdrant 向量记忆库"
-        echo -e " ${CYAN}3.${NC} 📡 通道接入管理"
-        echo -e " ${YELLOW}4.${NC} 🔄 重启核心引擎"
+        echo -e " ${CYAN}3.${NC} 📡 矩阵节点管理总线 (增删启停 QQ/TG)"
+        echo -e " ${YELLOW}4.${NC} 🔄 热重载核心引擎"
         echo -e " ${YELLOW}5.${NC} 🛑 停止核心引擎"
-        echo -e " ${YELLOW}6.${NC} 📜 查看 OpenClaw 日志"
+        echo -e " ${YELLOW}6.${NC} 📜 查看内核级日志"
         echo -e " ${RED}9.${NC} ☢️  安全销毁系统"
-        echo -e " ${YELLOW}0.${NC} 🚪 退出"
+        echo -e " ${YELLOW}0.${NC} 🚪 退出面板"
         echo -e "${BLUE}=================================================${NC}"
         read -r -p "指令下达: " main_choice
 
@@ -488,7 +570,7 @@ main_menu() {
 }
 
 # ==========================================
-# 入口
+# 入口路由
 # ==========================================
 check_env
 
@@ -499,8 +581,11 @@ case "${1:-menu}" in
     deploy-memory) cmd_deploy_memory ;;
     restart-core)  cmd_restart_core ;;
     stop-core)     cmd_stop_core ;;
-    add-qq)        cmd_add_qq ;;
-    remove-qq)     cmd_remove_qq ;;
+    matrix-add)    cmd_matrix_add ;;
+    matrix-pause)  cmd_matrix_pause ;;
+    matrix-resume) cmd_matrix_resume ;;
+    matrix-delete) cmd_matrix_delete ;;
+    matrix-list)   cmd_matrix_list ;;
     logs)          view_logs ;;
     nuke)          nuke_system ;;
     help|-h|--help) show_help ;;
