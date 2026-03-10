@@ -279,7 +279,15 @@ install_core() {
 
     # 3. 摘掉遮羞布：执行核心安装，并允许终端打印真实报错以供溯源
     log_info "正在向内核注入虚拟渲染依赖 (过程日志已开启可视化)..."
-    if ! apt-get install -y curl wget git xvfb fluxbox x11vnc jq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 fonts-wqy-zenhei fonts-wqy-microhei; then
+    
+    # [新增核心逻辑]: 动态推断音频底层库版本，跨越 Y2038 t64 架构断层
+    local asound_pkg="libasound2"
+    if apt-cache search --names-only '^libasound2t64$' | grep -q 'libasound2t64'; then
+        asound_pkg="libasound2t64"
+        log_warn "检测到 t64 新架构环境，已自动适配音频依赖矩阵。"
+    fi
+
+    if ! apt-get install -y curl wget git xvfb fluxbox x11vnc jq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 "${asound_pkg}" fonts-wqy-zenhei fonts-wqy-microhei; then
         log_error "底层依赖注入失败！请根据上方 APT 打印的红色英文报错排查源节点问题。"
         return 1
     fi
@@ -395,7 +403,7 @@ main_menu() {
         echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
-        echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座 (Node/Xvfb/Systemd)"
+        echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
         echo -e " ${CYAN}2.${NC} 🧠 部署 Qdrant 向量记忆库"
         echo -e " ${CYAN}3.${NC} 📡 矩阵节点管理总线 (增删启停 QQ/TG)"
         echo -e " ${YELLOW}4.${NC} 🔄 热重载核心引擎"
