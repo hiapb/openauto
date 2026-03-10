@@ -563,7 +563,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢1 ${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
