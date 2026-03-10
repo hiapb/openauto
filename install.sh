@@ -332,7 +332,7 @@ install_core() {
         cp /etc/systemd/system/openclaw.service "/etc/systemd/system/openclaw.service.bak_$(date +%s)"
     fi
 
-    cat > /etc/systemd/system/openclaw.service <<SERVICE
+cat > /etc/systemd/system/openclaw.service <<SERVICE
 [Unit]
 Description=OpenClaw AI Matrix Gateway
 After=network.target
@@ -343,7 +343,8 @@ User=root
 WorkingDirectory=/opt/openclaw
 Environment="DISPLAY=:99"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" ${oc_path} start
+# [核心修正]：废弃 start 子命令，对齐最新版 openclaw gateway 守护进程协议
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" ${oc_path} gateway
 Restart=always
 RestartSec=10
 
@@ -421,7 +422,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢1 ${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
