@@ -24,6 +24,11 @@ log_warn()    { printf "${YELLOW}[WARN] %s${NC}\n" "$1"; }
 log_error()   { printf "${RED}[ERROR] %s${NC}\n" "$1"; }
 pause()       { echo; read -n 1 -s -r -p "按任意键继续..."; echo; }
 
+OPENCLAW_HOME="/opt/openclaw"
+MATRIX_DB="${OPENCLAW_HOME}/matrix.db"
+OPENCLAW_PORT="${OPENCLAW_PORT:-18789}"
+OPENCLAW_BIN_EXPECTED="/usr/bin/openclaw"
+
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         log_error "请提权至 root 用户执行。"
@@ -52,7 +57,7 @@ container_is_running_exact() {
 }
 
 wait_for_http() {
-    local url="$1" retries="${2:-20}" delay="${3:-2}" i
+    local url="$1" retries="${2:-30}" delay="${3:-2}" i
     for ((i=1; i<=retries; i++)); do
         if curl -fsS --max-time 5 "${url}" >/dev/null 2>&1; then
             return 0
@@ -64,18 +69,6 @@ wait_for_http() {
     return 1
 }
 
-restart_openclaw_service() {
-    require_root || return 1
-    systemctl restart openclaw
-    sleep 2
-    if service_is_active openclaw; then
-        log_success "引擎已在内核级热重载。"
-        return 0
-    fi
-    log_error "服务重载溃败，请执行 logs 指令查阅 journald 日志。"
-    return 1
-}
-
 check_env() {
     if ! command -v apt-get >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
         log_error "仅支持搭载 systemd 的 Debian/Ubuntu 服务器。"
@@ -84,10 +77,14 @@ check_env() {
 }
 
 check_core_status() {
-    if service_is_active openclaw; then
-        printf "${GREEN}在线${NC}"
+    if command -v openclaw >/dev/null 2>&1; then
+        if openclaw gateway status >/dev/null 2>&1; then
+            printf "${GREEN}在线${NC}"
+        else
+            printf "${RED}离线${NC}"
+        fi
     else
-        printf "${RED}离线${NC}"
+        printf "${RED}未安装${NC}"
     fi
 }
 
@@ -109,25 +106,68 @@ ensure_docker() {
     systemctl enable --now docker
 }
 
-ensure_node20() {
+get_major_version() {
+    local v="$1"
+    v="${v#v}"
+    printf "%s" "${v%%.*}"
+}
+
+get_full_node_version() {
+    node -v 2>/dev/null | sed 's/^v//'
+}
+
+node_version_meets_minimum() {
+    local current min
+    current="$1"
+    min="$2"
+    dpkg --compare-versions "${current}" ge "${min}"
+}
+
+ensure_node22() {
     require_root || return 1
 
+    local min_node="22.12.0"
+    local reinstall=0
+
     if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-        if node -v | grep -q '^v20\.'; then
+        local current_node
+        current_node="$(get_full_node_version || true)"
+        if [[ -n "${current_node}" ]] && node_version_meets_minimum "${current_node}" "${min_node}"; then
+            log_success "Node.js 已满足要求: v${current_node}"
             return 0
+        fi
+        reinstall=1
+    else
+        reinstall=1
+    fi
+
+    if [[ "${reinstall}" -eq 1 ]]; then
+        log_warn "检测到 Node.js 不满足 OpenClaw 当前要求，切换到 Node.js >= ${min_node} ..."
+        apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+            | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+
+        echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+            > /etc/apt/sources.list.d/nodesource.list
+
+        apt-get update -y >/dev/null 2>&1
+        if ! apt-get install -y nodejs >/dev/null 2>&1; then
+            log_error "Node.js 22 安装失败。"
+            return 1
         fi
     fi
 
-    log_warn "探针检测到 Node.js 碎片或版本断层，启动焦土清理协议..."
-    apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
-    apt-get autoremove -y >/dev/null 2>&1 || true
-
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-    log_info "注入 Node.js 20 与原生编译工具链 (build-essential/python3)..."
-    if ! apt-get install -y nodejs build-essential python3 >/dev/null 2>&1; then
-        log_error "Node.js 引擎部署遭遇物理断层。"
+    local current_node
+    current_node="$(get_full_node_version || true)"
+    if [[ -z "${current_node}" ]] || ! node_version_meets_minimum "${current_node}" "${min_node}"; then
+        log_error "Node.js 版本仍不达标。当前: v${current_node:-unknown}，要求: >= ${min_node}"
         return 1
     fi
+
+    log_success "Node.js 已就绪: v${current_node}"
 }
 
 _get_machine_key() {
@@ -141,7 +181,7 @@ _get_machine_key() {
 _encrypt() {
     if [[ "$1" == "none" || -z "$1" ]]; then
         echo -n "none"
-        return
+        return 0
     fi
     echo -n "$1" | openssl enc -aes-256-cbc -pbkdf2 -salt -a -pass "pass:$(_get_machine_key)" 2>/dev/null || echo -n "ENC_ERR"
 }
@@ -149,15 +189,13 @@ _encrypt() {
 _decrypt() {
     if [[ "$1" == "none" || -z "$1" || "$1" == "ENC_ERR" ]]; then
         echo -n "$1"
-        return
+        return 0
     fi
     echo -n "$1" | openssl enc -aes-256-cbc -pbkdf2 -salt -a -d -pass "pass:$(_get_machine_key)" 2>/dev/null || echo -n "DEC_ERR"
 }
 
-MATRIX_DB="/opt/openclaw/matrix.db"
-
 init_matrix_db() {
-    mkdir -p /opt/openclaw
+    mkdir -p "${OPENCLAW_HOME}"
     if [[ ! -f "${MATRIX_DB}" ]]; then
         touch "${MATRIX_DB}"
         chmod 600 "${MATRIX_DB}"
@@ -174,16 +212,19 @@ validate_alias() {
 
 _gateway_inject() {
     local alias="$1" platform="$2" cred1="$3" cred2="$4"
+
     if [[ "${platform}" == "qq" ]]; then
         (
             export OC_TEMP="${cred1}:${cred2}"
             openclaw channels add --channel "${alias}" --token "${OC_TEMP}" >/dev/null 2>&1
         )
+        return $?
     elif [[ "${platform}" == "tg" ]]; then
         openclaw channels add --channel "${alias}" --token "${cred1}" >/dev/null 2>&1
-    else
-        return 1
+        return $?
     fi
+
+    return 1
 }
 
 _gateway_eject() {
@@ -192,7 +233,9 @@ _gateway_eject() {
 
 list_matrix() {
     clear
+    init_matrix_db
     echo -e "${CYAN}=== 节点状态池 (硬件级加密固化) ===${NC}"
+
     if [[ ! -s "${MATRIX_DB}" ]]; then
         echo -e "${YELLOW}无节点记录。${NC}"
         return
@@ -200,6 +243,7 @@ list_matrix() {
 
     printf "%-18s | %-8s | %-10s\n" "节点代号" "通讯协议" "运行时状态"
     echo "------------------------------------------------"
+
     while IFS='|' read -r alias platform status c1 c2; do
         if [[ "${status}" == "active" ]]; then
             printf "%-18s | %-8s | ${GREEN}%-10s${NC}\n" "${alias}" "${platform}" "[数据泵开启]"
@@ -207,6 +251,7 @@ list_matrix() {
             printf "%-18s | %-8s | ${YELLOW}%-10s${NC}\n" "${alias}" "${platform}" "[物理熔断]"
         fi
     done < "${MATRIX_DB}"
+
     echo "------------------------------------------------"
 }
 
@@ -216,7 +261,7 @@ add_matrix_node() {
     init_matrix_db
 
     local alias platform c1 c2 plat_choice
-    read -p "定义该节点的唯一机器代号: " alias
+    read -r -p "定义该节点的唯一机器代号: " alias
     validate_alias "${alias}" || return 1
 
     if awk -F'|' -v tgt="${alias}" '$1 == tgt {found=1} END {exit(found ? 0 : 1)}' "${MATRIX_DB}"; then
@@ -225,12 +270,12 @@ add_matrix_node() {
     fi
 
     echo -e "1) 腾讯 QQ (官方)   2) Telegram (海外)"
-    read -p "选择承载协议(1-2): " plat_choice
+    read -r -p "选择承载协议(1-2): " plat_choice
 
     if [[ "${plat_choice}" == "1" ]]; then
         platform="qq"
-        read -p "输入 AppID: " c1
-        read -s -p "输入 AppSecret: " c2
+        read -r -p "输入 AppID: " c1
+        read -r -s -p "输入 AppSecret: " c2
         echo
         if [[ -z "${c1}" || -z "${c2}" ]]; then
             log_error "握手凭证缺失"
@@ -239,7 +284,7 @@ add_matrix_node() {
         openclaw plugins install @sliverp/qqbot@latest >/dev/null 2>&1 || true
     elif [[ "${plat_choice}" == "2" ]]; then
         platform="tg"
-        read -s -p "输入 Bot Token: " c1
+        read -r -s -p "输入 Bot Token: " c1
         echo
         c2="none"
         if [[ -z "${c1}" ]]; then
@@ -257,8 +302,8 @@ add_matrix_node() {
     fi
 
     local enc_c1 enc_c2
-    enc_c1=$(_encrypt "${c1}")
-    enc_c2=$(_encrypt "${c2}")
+    enc_c1="$(_encrypt "${c1}")"
+    enc_c2="$(_encrypt "${c2}")"
     echo "${alias}|${platform}|active|${enc_c1}|${enc_c2}" >> "${MATRIX_DB}"
 
     restart_openclaw_service
@@ -269,10 +314,10 @@ pause_matrix_node() {
     init_matrix_db
 
     local alias record r_plat r_status r_c1 r_c2
-    read -p "输入需【休眠】的节点代号: " alias
+    read -r -p "输入需【休眠】的节点代号: " alias
     validate_alias "${alias}" || return 1
 
-    record=$(awk -F'|' -v tgt="${alias}" '$1 == tgt' "${MATRIX_DB}")
+    record="$(awk -F'|' -v tgt="${alias}" '$1 == tgt' "${MATRIX_DB}")"
     if [[ -z "${record}" ]]; then
         log_error "未匹配到节点。"
         return 1
@@ -297,10 +342,10 @@ resume_matrix_node() {
     init_matrix_db
 
     local alias record r_plat r_status enc_c1 enc_c2 dec_c1 dec_c2
-    read -p "输入需【唤醒】的节点代号: " alias
+    read -r -p "输入需【唤醒】的节点代号: " alias
     validate_alias "${alias}" || return 1
 
-    record=$(awk -F'|' -v tgt="${alias}" '$1 == tgt' "${MATRIX_DB}")
+    record="$(awk -F'|' -v tgt="${alias}" '$1 == tgt' "${MATRIX_DB}")"
     if [[ -z "${record}" ]]; then
         log_error "未匹配到节点。"
         return 1
@@ -312,8 +357,8 @@ resume_matrix_node() {
         return 0
     fi
 
-    dec_c1=$(_decrypt "${enc_c1}")
-    dec_c2=$(_decrypt "${enc_c2}")
+    dec_c1="$(_decrypt "${enc_c1}")"
+    dec_c2="$(_decrypt "${enc_c2}")"
     if [[ "${dec_c1}" == "DEC_ERR" || "${dec_c2}" == "DEC_ERR" ]]; then
         log_error "解密失败！"
         return 1
@@ -336,7 +381,7 @@ delete_matrix_node() {
     init_matrix_db
 
     local alias confirm
-    read -p "输入需【永久销毁】的节点代号: " alias
+    read -r -p "输入需【永久销毁】的节点代号: " alias
     validate_alias "${alias}" || return 1
 
     if ! awk -F'|' -v tgt="${alias}" '$1 == tgt {found=1} END {exit(found ? 0 : 1)}' "${MATRIX_DB}"; then
@@ -344,7 +389,7 @@ delete_matrix_node() {
         return 1
     fi
 
-    read -p "确认物理抹除该节点？(y/n): " confirm
+    read -r -p "确认物理抹除该节点？(y/n): " confirm
     if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
         return 0
     fi
@@ -388,11 +433,18 @@ deploy_memory_engine() {
     require_root || return 1
     clear
     ensure_docker
+
     mkdir -p /opt/qdrant/storage
     docker rm -f qdrant >/dev/null 2>&1 || true
-    docker run -d --name qdrant -p 6333:6333 -p 6334:6334 -v /opt/qdrant/storage:/qdrant/storage --restart always qdrant/qdrant >/dev/null
+    docker run -d \
+        --name qdrant \
+        -p 6333:6333 \
+        -p 6334:6334 \
+        -v /opt/qdrant/storage:/qdrant/storage \
+        --restart always \
+        qdrant/qdrant >/dev/null
 
-    if wait_for_http "http://localhost:6333/healthz" 20 2 || wait_for_http "http://localhost:6333" 20 2; then
+    if wait_for_http "http://127.0.0.1:6333/healthz" 20 2 || wait_for_http "http://127.0.0.1:6333" 20 2; then
         echo
         if container_is_running_exact qdrant; then
             log_success "Qdrant 启动成功。"
@@ -407,26 +459,64 @@ deploy_memory_engine() {
     fi
 }
 
-install_core() {
+restart_openclaw_service() {
     require_root || return 1
-    clear
-    log_info "开始烧录算力底层基座 (防阻塞模式)..."
-    export DEBIAN_FRONTEND=noninteractive
+    require_cmd openclaw || return 1
 
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-        log_warn "探针检测到系统底层正被 apt 进程锁死 (可能在后台自动更新)，强制挂起等待 5 秒..."
-        sleep 5
-    done
+    if ! openclaw gateway restart >/dev/null 2>&1; then
+        log_warn "gateway restart 失败，尝试 start ..."
+        if ! openclaw gateway start >/dev/null 2>&1; then
+            log_error "OpenClaw 服务重启失败。"
+            return 1
+        fi
+    fi
 
-    log_info "正在刷新系统源矩阵并注入扩展仓库..."
+    sleep 3
+    if openclaw gateway status >/dev/null 2>&1; then
+        log_success "引擎已热重载。"
+        return 0
+    fi
+
+    log_error "服务重载失败，请执行 logs 指令排查。"
+    return 1
+}
+
+install_openclaw_cli() {
+    log_info "安装 OpenClaw CLI ..."
+    local npm_log="/tmp/openclaw_npm_install.log"
+
+    npm cache clean --force >/dev/null 2>&1 || true
+
+    if ! npm install -g openclaw@latest > "${npm_log}" 2>&1; then
+        log_error "CLI 引擎包拉取失败！底层 npm 日志如下："
+        echo -e "${YELLOW}==================== NPM ERROR ====================${NC}"
+        tail -n 60 "${npm_log}" || true
+        echo -e "${YELLOW}===================================================${NC}"
+        return 1
+    fi
+
+    if ! command -v openclaw >/dev/null 2>&1; then
+        log_error "CLI 安装完成，但命令未进入 PATH。"
+        return 1
+    fi
+
+    log_success "OpenClaw CLI 安装成功。"
+}
+
+prepare_system_dependencies() {
+    log_info "刷新软件源矩阵..."
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y software-properties-common >/dev/null 2>&1 || true
-    add-apt-repository universe -y >/dev/null 2>&1 || true
+    apt-get install -y software-properties-common ca-certificates gnupg >/dev/null 2>&1 || true
+
+    if command -v add-apt-repository >/dev/null 2>&1; then
+        add-apt-repository universe -y >/dev/null 2>&1 || true
+    fi
+
     apt-get update -y >/dev/null 2>&1 || true
 
-    log_info "正在向内核注入虚拟渲染依赖 (过程日志已开启可视化)..."
-
+    log_info "正在注入虚拟渲染与构建依赖..."
     local asound_pkg="libasound2"
+
     if apt-cache search --names-only '^libasound2t64$' | grep -q 'libasound2t64'; then
         asound_pkg="libasound2t64"
         log_warn "检测到 t64 新架构环境，已自动适配音频依赖矩阵。"
@@ -434,104 +524,135 @@ install_core() {
 
     if ! apt-get install -y \
         curl wget git xvfb fluxbox x11vnc jq \
+        build-essential python3 pkg-config cmake make g++ \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-        "${asound_pkg}" fonts-wqy-zenhei fonts-wqy-microhei; then
-        log_error "底层依赖注入失败！请根据上方 APT 打印的红色英文报错排查源节点问题。"
+        "${asound_pkg}" fonts-wqy-zenhei fonts-wqy-microhei >/dev/null 2>&1; then
+        log_error "底层依赖注入失败。"
         return 1
     fi
 
     require_cmd xvfb-run
-    ensure_node20
+    require_cmd cmake
+}
 
-    log_info "同步核心 CLI 包 (启用日志动态接管)..."
-    local npm_log="/tmp/openclaw_npm_install.log"
-
-    if ! npm install -g openclaw@latest > "${npm_log}" 2>&1; then
-        log_error "CLI 引擎包拉取遭遇物理断层！底层 npm 死亡协议如下："
-        echo -e "${YELLOW}==================== NPM ERROR ====================${NC}"
-        tail -n 20 "${npm_log}"
-        echo -e "${YELLOW}===================================================${NC}"
-        return 1
-    fi
-
-    local oc_path
-    oc_path="$(command -v openclaw || true)"
-    if [[ -z "${oc_path}" ]]; then
-        log_error "CLI 路径寻址失败。"
-        return 1
-    fi
-
-    mkdir -p /opt/openclaw
+init_openclaw_gateway() {
+    require_cmd openclaw || return 1
+    mkdir -p "${OPENCLAW_HOME}"
     init_matrix_db
 
-    if [[ -f /etc/systemd/system/openclaw.service ]]; then
-        cp /etc/systemd/system/openclaw.service "/etc/systemd/system/openclaw.service.bak_$(date +%s)"
+    log_info "开始初始化 OpenClaw ..."
+    if openclaw onboard --install-daemon; then
+        log_success "OpenClaw 已完成 onboard 初始化。"
+        return 0
     fi
 
-cat > /etc/systemd/system/openclaw.service <<SERVICE
-[Unit]
-Description=OpenClaw AI Matrix Gateway
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/openclaw
-Environment="DISPLAY=:99"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset" ${oc_path} gateway
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-    systemctl daemon-reload
-    systemctl enable openclaw >/dev/null 2>&1
-    systemctl start openclaw
-
-    sleep 2
-    if service_is_active openclaw; then
-        log_success "核心服务已启动。"
-    else
-        log_error "核心启动失败。"
+    log_warn "onboard --install-daemon 失败，尝试拆分执行..."
+    if ! openclaw onboard; then
+        log_error "openclaw onboard 初始化失败。"
         return 1
     fi
+
+    if ! openclaw gateway install; then
+        log_error "openclaw gateway install 失败。"
+        return 1
+    fi
+
+    if ! openclaw gateway start; then
+        log_error "openclaw gateway start 失败。"
+        return 1
+    fi
+
+    log_success "OpenClaw Gateway 初始化完成。"
+}
+
+verify_openclaw_health() {
+    log_info "验证 OpenClaw 服务状态..."
+    sleep 3
+
+    if openclaw gateway status >/dev/null 2>&1; then
+        log_success "核心服务已启动。"
+        return 0
+    fi
+
+    log_warn "gateway status 返回异常，尝试输出诊断信息..."
+    openclaw gateway status || true
+    openclaw logs --follow >/tmp/openclaw_logs_probe.txt 2>&1 &
+    sleep 3
+    pkill -f "openclaw logs --follow" >/dev/null 2>&1 || true
+
+    if [[ -f /tmp/openclaw_logs_probe.txt ]]; then
+        echo -e "${YELLOW}==================== GATEWAY LOG SNIPPET ====================${NC}"
+        tail -n 50 /tmp/openclaw_logs_probe.txt || true
+        echo -e "${YELLOW}=============================================================${NC}"
+    fi
+
+    log_error "核心启动失败。"
+    return 1
+}
+
+install_core() {
+    require_root || return 1
+    clear
+    log_info "开始部署 OpenClaw 核心..."
+    export DEBIAN_FRONTEND=noninteractive
+
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        log_warn "探针检测到 apt 锁，等待 5 秒..."
+        sleep 5
+    done
+
+    prepare_system_dependencies
+    ensure_node22
+    install_openclaw_cli
+    init_openclaw_gateway
+    verify_openclaw_health
 }
 
 nuke_system() {
     require_root || return 1
+
     local backup_file="/root/openclaw_nuke_backup_$(date +%s).tar.gz"
-    tar -czf "${backup_file}" /opt/openclaw /opt/qdrant 2>/dev/null || true
+    tar -czf "${backup_file}" /opt/openclaw /opt/qdrant "${HOME}/.openclaw" 2>/dev/null || true
 
     local nuke_confirm
-    read -p "输入 'DELETE-OPENCLAW' 执行抹除: " nuke_confirm
+    read -r -p "输入 'DELETE-OPENCLAW' 执行抹除: " nuke_confirm
     if [[ "${nuke_confirm}" != "DELETE-OPENCLAW" ]]; then
         return 0
     fi
 
-    systemctl stop openclaw 2>/dev/null || true
-    systemctl disable openclaw 2>/dev/null || true
-    rm -f /etc/systemd/system/openclaw.service
-    systemctl daemon-reload
-    rm -rf /root/.openclaw /opt/openclaw
-    command -v npm >/dev/null 2>&1 && npm uninstall -g openclaw >/dev/null 2>&1 || true
-    command -v docker >/dev/null 2>&1 && docker rm -f qdrant >/dev/null 2>&1 || true
+    if command -v openclaw >/dev/null 2>&1; then
+        openclaw gateway stop >/dev/null 2>&1 || true
+        openclaw gateway uninstall >/dev/null 2>&1 || true
+    fi
+
+    rm -rf /root/.openclaw /root/.openclaw-* "${HOME}/.openclaw" "${HOME}/.openclaw-"* 2>/dev/null || true
+    rm -rf /opt/openclaw
+
+    if command -v npm >/dev/null 2>&1; then
+        npm uninstall -g openclaw >/dev/null 2>&1 || true
+    fi
+
+    if command -v docker >/dev/null 2>&1; then
+        docker rm -f qdrant >/dev/null 2>&1 || true
+    fi
+
     rm -rf /opt/qdrant
+    rm -f /tmp/openclaw_npm_install.log /tmp/openclaw_logs_probe.txt
+
     log_success "物理环境已清理。"
 }
 
 view_logs() {
     require_root || return 1
-    journalctl -u openclaw -f
+    require_cmd openclaw || return 1
+    openclaw logs --follow
 }
 
 cmd_install_core()  { install_core; }
 cmd_deploy_memory() { deploy_memory_engine; }
 cmd_restart_core()  { restart_openclaw_service; }
-cmd_stop_core()     { require_root || return 1; systemctl stop openclaw; log_warn "OpenClaw 已停止。"; }
+cmd_stop_core()     { require_root || return 1; openclaw gateway stop; log_warn "OpenClaw 已停止。"; }
 cmd_matrix_add()    { add_matrix_node; }
 cmd_matrix_pause()  { pause_matrix_node; }
 cmd_matrix_resume() { resume_matrix_node; }
@@ -563,7 +684,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢2${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
