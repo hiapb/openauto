@@ -261,23 +261,48 @@ deploy_memory_engine() {
 install_core() {
     require_root || return 1
     clear
+    log_info "开始烧录算力底层基座 (防阻塞模式)..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y curl wget git xvfb fluxbox x11vnc jq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 fonts-wqy-zenhei fonts-wqy-microhei >/dev/null 2>&1
+    
+    # 1. 暴力破解 Dpkg 锁死博弈 (等待后台自动更新释放资源)
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        log_warn "探针检测到系统底层正被 apt 进程锁死 (可能在后台自动更新)，强制挂起等待 5 秒..."
+        sleep 5
+    done
+
+    # 2. 强行补全可能缺失的 Universe 软件源
+    log_info "正在刷新系统源矩阵并注入扩展仓库..."
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    add-apt-repository universe -y >/dev/null 2>&1 || true
+    apt-get update -y >/dev/null 2>&1 || true
+
+    # 3. 摘掉遮羞布：执行核心安装，并允许终端打印真实报错以供溯源
+    log_info "正在向内核注入虚拟渲染依赖 (过程日志已开启可视化)..."
+    if ! apt-get install -y curl wget git xvfb fluxbox x11vnc jq libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 fonts-wqy-zenhei fonts-wqy-microhei; then
+        log_error "底层依赖注入失败！请根据上方 APT 打印的红色英文报错排查源节点问题。"
+        return 1
+    fi
+
     require_cmd xvfb-run
     ensure_node20
+
+    log_info "同步核心 CLI 包..."
     npm install -g @openclaw/cli >/dev/null 2>&1
     local oc_path
     oc_path="$(command -v openclaw || true)"
     if [ -z "${oc_path}" ]; then
-        log_error "CLI 定位失败。"
+        log_error "CLI 路径寻址失败。"
         return 1
     fi
+
     mkdir -p /opt/openclaw
     init_matrix_db
+
     if [[ -f /etc/systemd/system/openclaw.service ]]; then
         cp /etc/systemd/system/openclaw.service /etc/systemd/system/openclaw.service.bak_$(date +%s)
     fi
+
     cat > /etc/systemd/system/openclaw.service <<SERVICE
 [Unit]
 Description=OpenClaw AI Matrix Gateway
@@ -296,9 +321,11 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 SERVICE
+
     systemctl daemon-reload
     systemctl enable openclaw >/dev/null 2>&1
     systemctl start openclaw
+
     sleep 2
     if service_is_active openclaw; then
         log_success "核心服务已启动。"
@@ -365,7 +392,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 (V3.2)${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座 (Node/Xvfb/Systemd)"
