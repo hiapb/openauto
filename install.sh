@@ -308,8 +308,9 @@ install_core() {
 
     log_info "同步核心 CLI 包 (启用日志动态接管)..."
     local npm_log="/tmp/openclaw_npm_install.log"
-    # [核心逻辑]: 剥离重定向黑洞。成功则静默，失败则引爆日志以供溯源。
-    if ! npm install -g @openclaw/cli > "${npm_log}" 2>&1; then
+    
+    # [核心修正]: 斩除 @ 组织域，精准对齐官方的全局注册空间
+    if ! npm install -g openclaw@latest > "${npm_log}" 2>&1; then
         log_error "CLI 引擎包拉取遭遇物理断层！底层 npm 死亡协议如下："
         echo -e "${YELLOW}==================== NPM ERROR ====================${NC}"
         tail -n 20 "${npm_log}"
@@ -374,7 +375,7 @@ nuke_system() {
     rm -f /etc/systemd/system/openclaw.service
     systemctl daemon-reload
     rm -rf /root/.openclaw /opt/openclaw
-    command -v npm >/dev/null 2>&1 && npm uninstall -g @openclaw/cli >/dev/null 2>&1 || true
+    command -v npm >/dev/null 2>&1 && npm uninstall -g openclaw >/dev/null 2>&1 || true
     command -v docker >/dev/null 2>&1 && docker rm -f qdrant >/dev/null 2>&1 || true
     rm -rf /opt/qdrant
     log_success "物理环境已清理。"
@@ -420,7 +421,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 1${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
