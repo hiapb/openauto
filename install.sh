@@ -63,11 +63,23 @@ ensure_docker() {
 
 ensure_node20() {
     require_root || return 1
-    if command -v node >/dev/null 2>&1; then
+    # 1. 严格校验 Node 与 NPM 双核心的存活与版本兼容性
+    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
         if node -v | grep -q '^v20\.'; then return 0; fi
     fi
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    apt-get install -y nodejs >/dev/null 2>&1
+    
+    log_warn "探针检测到 Node.js 碎片或版本断层，启动焦土清理协议..."
+    # 2. 斩断历史依赖包袱，防止新旧包发生符号链接碰撞
+    apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+
+    # 3. 部署新架构并强制注入原生 C++ 编译护航链
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+    log_info "注入 Node.js 20 与原生编译工具链 (build-essential/python3)..."
+    if ! apt-get install -y nodejs build-essential python3 >/dev/null 2>&1; then
+        log_error "Node.js 引擎部署遭遇物理断层。"
+        return 1
+    fi
 }
 
 _get_machine_key() { [[ -f /etc/machine-id ]] && cat /etc/machine-id || hostname; }
@@ -264,7 +276,7 @@ install_core() {
     log_info "开始烧录算力底层基座 (防阻塞模式)..."
     export DEBIAN_FRONTEND=noninteractive
     
-    # 1. 暴力破解 Dpkg 锁死博弈 (等待后台自动更新释放资源)
+    # 1. 暴力破解 Dpkg 锁死博弈
     while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
         log_warn "探针检测到系统底层正被 apt 进程锁死 (可能在后台自动更新)，强制挂起等待 5 秒..."
         sleep 5
@@ -277,10 +289,9 @@ install_core() {
     add-apt-repository universe -y >/dev/null 2>&1 || true
     apt-get update -y >/dev/null 2>&1 || true
 
-    # 3. 摘掉遮羞布：执行核心安装，并允许终端打印真实报错以供溯源
     log_info "正在向内核注入虚拟渲染依赖 (过程日志已开启可视化)..."
     
-    # [新增核心逻辑]: 动态推断音频底层库版本，跨越 Y2038 t64 架构断层
+    # [核心逻辑]: 动态推断音频底层库版本，跨越 Y2038 t64 架构断层
     local asound_pkg="libasound2"
     if apt-cache search --names-only '^libasound2t64$' | grep -q 'libasound2t64'; then
         asound_pkg="libasound2t64"
@@ -295,8 +306,17 @@ install_core() {
     require_cmd xvfb-run
     ensure_node20
 
-    log_info "同步核心 CLI 包..."
-    npm install -g @openclaw/cli >/dev/null 2>&1
+    log_info "同步核心 CLI 包 (启用日志动态接管)..."
+    local npm_log="/tmp/openclaw_npm_install.log"
+    # [核心逻辑]: 剥离重定向黑洞。成功则静默，失败则引爆日志以供溯源。
+    if ! npm install -g @openclaw/cli > "${npm_log}" 2>&1; then
+        log_error "CLI 引擎包拉取遭遇物理断层！底层 npm 死亡协议如下："
+        echo -e "${YELLOW}==================== NPM ERROR ====================${NC}"
+        tail -n 20 "${npm_log}"
+        echo -e "${YELLOW}===================================================${NC}"
+        return 1
+    fi
+
     local oc_path
     oc_path="$(command -v openclaw || true)"
     if [ -z "${oc_path}" ]; then
@@ -308,7 +328,7 @@ install_core() {
     init_matrix_db
 
     if [[ -f /etc/systemd/system/openclaw.service ]]; then
-        cp /etc/systemd/system/openclaw.service /etc/systemd/system/openclaw.service.bak_$(date +%s)
+        cp /etc/systemd/system/openclaw.service "/etc/systemd/system/openclaw.service.bak_$(date +%s)"
     fi
 
     cat > /etc/systemd/system/openclaw.service <<SERVICE
@@ -400,7 +420,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=================================================${NC}"
-        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 ${NC}"
+        echo -e "       ${GREEN}OpenClaw 矩阵算力中枢 1${NC}"
         echo -e "       算力状态: $(check_core_status) | 记忆状态: $(check_memory_status)"
         echo -e "${BLUE}=================================================${NC}"
         echo -e " ${YELLOW}1.${NC} 🚀 部署 AI 算力底座"
